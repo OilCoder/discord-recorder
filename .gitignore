@@ -1,0 +1,16 @@
+# Entorno
+.env
+
+# Archivos de sesión generados
+tmp/
+transcript/
+wiki/
+
+# Modelos de Whisper cacheados
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/

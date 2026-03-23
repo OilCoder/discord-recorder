@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    user: "1000:1000"
+    env_file: .env
+    volumes:
+      - ./transcript:/app/transcript
+      - ./wiki:/app/wiki
+      - ./tmp:/app/tmp
+      - ./models:/app/.cache
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

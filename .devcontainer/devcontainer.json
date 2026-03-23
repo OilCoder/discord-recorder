@@ -1,0 +1,25 @@
+{
+  "name": "vampire-discord-bot",
+  "dockerFile": "../Dockerfile",
+  "context": "..",
+  "remoteUser": "ubuntu",
+  "workspaceFolder": "/app",
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "DISCORD_TOKEN": "${localEnv:DISCORD_TOKEN}",
+    "WHISPER_MODEL": "${localEnv:WHISPER_MODEL}"
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder}/output,target=/app/output,type=bind",
+    "source=${localWorkspaceFolder}/tmp,target=/app/tmp,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "Anthropic.claude-code"
+      ]
+    }
+  }
+}
