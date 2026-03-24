@@ -9,7 +9,7 @@ from main import run_pipeline
 
 load_dotenv()
 
-MASTER_USER = os.getenv("MASTER_USER", "")
+MASTER_USERS = {u.strip() for u in os.getenv("MASTER_USER", "").split(",") if u.strip()}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,7 +20,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _is_master(ctx: commands.Context) -> bool:
-    return ctx.author.name == MASTER_USER
+    return ctx.author.name in MASTER_USERS
 
 
 def _latest_wiki(pattern: str) -> str | None:

@@ -7,36 +7,42 @@ import aiohttp
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
 CLASSIFIER_MODEL = os.getenv("CLASSIFIER_MODEL", "mistral")
 
-BATCH_SIZE = 30
-OVERLAP = 5
+CONTEXT_WINDOW = 50   # líneas que ve el modelo para entender el contexto
+CLASSIFY_WINDOW = 30  # líneas del centro que realmente se clasifican
+CONTEXT_PAD = (CONTEXT_WINDOW - CLASSIFY_WINDOW) // 2  # 10 líneas de padding a cada lado
+STEP = CLASSIFY_WINDOW - 10  # avance de 20 → 10 líneas de solapamiento entre lotes
 MAX_PARALLEL = 4
 
 VALID_CATS = {"roleplay", "mesa", "off-topic"}
 
-SYSTEM_PROMPT = """Eres un clasificador de transcripciones de sesiones de rol de mesa (Vampiro: La Edad Oscura).
+SYSTEM_PROMPT = "\n\n".join([
+    "Eres un clasificador de transcripciones de sesiones de rol de mesa (Vampiro: La Edad Oscura).",
+    """### INSTRUCCIONES
+Recibirás un bloque de líneas dividido en tres secciones:
+- CONTEXTO PREVIO: líneas anteriores para entender qué está pasando. No las clasifiques.
+- LÍNEAS A CLASIFICAR: las líneas numeradas que debes clasificar.
+- CONTEXTO POSTERIOR: líneas siguientes para entender qué viene. No las clasifiques.
 
-Clasifica cada línea en una de estas categorías:
-- "roleplay": todo lo relacionado con el juego en sí — narración del master describiendo escenas, ambientes o personajes; diálogo en personaje; descripción de acciones, eventos o consecuencias dentro del mundo del juego; resúmenes narrativos de lo ocurrido
-- "mesa": intervenciones fuera del juego — preguntas de reglas, mecánicas, tiradas de dados, clarificaciones al master sobre cómo funciona algo del sistema, coordinación de turnos o de la sesión
-- "off-topic": conversación sin ninguna relación con la sesión — chistes, temas personales, pausas, problemas técnicos
+Primero lee el bloque completo para entender el tipo de conversación.
+Luego clasifica SOLO las líneas de la sección LÍNEAS A CLASIFICAR.""",
+    """### CATEGORÍAS
+- "roleplay": narración del master describiendo escenas, ambientes o personajes; diálogo en personaje; descripción de acciones, eventos o consecuencias dentro del mundo del juego
+- "mesa": preguntas de reglas, mecánicas, tiradas de dados, clarificaciones al master sobre cómo funciona algo del sistema, coordinación de turnos o de la sesión
+- "off-topic": temas personales, pausas, problemas técnicos, conversación sin relación al juego
 
 En caso de duda entre "roleplay" y "mesa", clasifica como "roleplay".
-
-Devuelve ÚNICAMENTE un objeto JSON con esta estructura exacta:
-{"classifications": [{"id": 0, "cat": "roleplay"}, {"id": 1, "cat": "mesa"}, ...]}
-
-Incluye una entrada por cada línea numerada, en el mismo orden."""
+Si el contexto indica que no hay sesión activa, sé muy estricto antes de clasificar algo como "roleplay" o "mesa".""",
+    '### FORMATO DE RESPUESTA\nDevuelve ÚNICAMENTE este JSON:\n{"classifications": [{"id": 0, "cat": "roleplay"}, {"id": 1, "cat": "mesa"}, ...]}\n\nUna entrada por cada línea numerada de LÍNEAS A CLASIFICAR, en el mismo orden.'
+])
 
 
 def _extract_json(raw: str) -> any:
     """Intenta parsear JSON desde la respuesta, manejando texto extra o markdown."""
     raw = raw.strip()
-    # Intentar directo
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Buscar bloque JSON entre ``` o extraer primer objeto/array
     import re
     match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
     if match:
@@ -44,7 +50,6 @@ def _extract_json(raw: str) -> any:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-    # Buscar primer { o [ hasta su cierre
     for start_char, end_char in [('{', '}'), ('[', ']')]:
         start = raw.find(start_char)
         end = raw.rfind(end_char)
@@ -60,7 +65,6 @@ def _parse_response(raw: str, batch_size: int) -> list[dict]:
     """Parsea la respuesta JSON del modelo. Devuelve lista de {id, cat}."""
     data = _extract_json(raw)
 
-    # Acepta {"classifications": [...]} o directamente [...]
     if isinstance(data, list):
         classifications = data
     elif isinstance(data, dict):
@@ -68,12 +72,17 @@ def _parse_response(raw: str, batch_size: int) -> list[dict]:
     else:
         raise ValueError(f"Formato inesperado: {type(data)}")
 
-    # Validar y sanitizar entradas
     result = []
-    for item in classifications:
-        idx = item.get("id")
-        cat = item.get("cat", "").lower().strip()
-        if idx is None or not isinstance(idx, int):
+    for i, item in enumerate(classifications):
+        if isinstance(item, str):
+            cat = item.lower().strip()
+            idx = i
+        elif isinstance(item, dict):
+            idx = item.get("id", i)
+            cat = item.get("cat", "").lower().strip()
+            if not isinstance(idx, int):
+                idx = i
+        else:
             continue
         if cat not in VALID_CATS:
             cat = "off-topic"
@@ -91,13 +100,36 @@ def _parse_response(raw: str, batch_size: int) -> list[dict]:
 
 async def _classify_batch(
     session: aiohttp.ClientSession,
-    batch_start: int,
-    batch_lines: list[str],
+    all_lines: list[str],
+    classify_start: int,
     semaphore: asyncio.Semaphore,
 ) -> tuple[int, list[dict]]:
-    """Clasifica un lote de líneas. Devuelve (batch_start, [{id, cat}, ...])."""
-    numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(batch_lines))
-    prompt = f"Clasifica cada línea de esta transcripción:\n\n{numbered}"
+    """Clasifica un lote con ventana de contexto externa.
+
+    Ventana externa (50 líneas): contexto para que el modelo entienda qué está pasando.
+    Ventana interna (30 líneas): las líneas que realmente se clasifican.
+    """
+    n = len(all_lines)
+    classify_end = min(classify_start + CLASSIFY_WINDOW, n)
+    classify_lines = all_lines[classify_start:classify_end]
+
+    # Contexto previo y posterior (fuera de las líneas a clasificar)
+    ctx_start = max(0, classify_start - CONTEXT_PAD)
+    ctx_end = min(n, classify_end + CONTEXT_PAD)
+    prev_ctx = all_lines[ctx_start:classify_start]
+    post_ctx = all_lines[classify_end:ctx_end]
+
+    sections = []
+    if prev_ctx:
+        sections.append("### CONTEXTO PREVIO\n" + "\n".join(prev_ctx))
+    sections.append(
+        "### LÍNEAS A CLASIFICAR\n" +
+        "\n".join(f"{i}: {line}" for i, line in enumerate(classify_lines))
+    )
+    if post_ctx:
+        sections.append("### CONTEXTO POSTERIOR\n" + "\n".join(post_ctx))
+
+    prompt = "\n\n".join(sections)
 
     for attempt in range(3):
         async with semaphore:
@@ -117,36 +149,29 @@ async def _classify_batch(
                 raw = data["response"]
 
         try:
-            classifications = _parse_response(raw, len(batch_lines))
-            return batch_start, classifications
+            classifications = _parse_response(raw, len(classify_lines))
+            return classify_start, classifications
         except (ValueError, KeyError) as e:
-            print(f"[classifier] Intento {attempt + 1}/3 falló para lote {batch_start}: {e}")
+            print(f"[classifier] Intento {attempt + 1}/3 falló para lote {classify_start}: {e}")
             print(f"[classifier] Respuesta raw: {raw[:300]}")
 
-    # Si los 3 intentos fallan, clasificar todo como off-topic
-    print(f"[classifier] Lote {batch_start} falló 3 veces, usando off-topic por defecto")
-    return batch_start, [{"id": i, "cat": "off-topic"} for i in range(len(batch_lines))]
+    print(f"[classifier] Lote {classify_start} falló 3 veces, usando off-topic por defecto")
+    return classify_start, [{"id": i, "cat": "off-topic"} for i in range(len(classify_lines))]
 
 
 async def _classify_all(lines: list[str]) -> list[str]:
-    """Clasifica todas las líneas en paralelo con solapamiento entre lotes."""
-    step = BATCH_SIZE - OVERLAP
-    batches = []
-    for start in range(0, len(lines), step):
-        end = min(start + BATCH_SIZE, len(lines))
-        batches.append((start, lines[start:end]))
-
+    """Clasifica todas las líneas con ventana móvil de contexto."""
     semaphore = asyncio.Semaphore(MAX_PARALLEL)
     results: dict[int, str] = {}
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            _classify_batch(session, start, batch, semaphore)
-            for start, batch in batches
+            _classify_batch(session, lines, start, semaphore)
+            for start in range(0, len(lines), STEP)
         ]
         batch_results = await asyncio.gather(*tasks)
 
-    # Merge: lotes posteriores (mayor start) ganan en la zona de solapamiento
+    # Merge: lotes posteriores ganan en zonas de solapamiento
     for batch_start, classifications in sorted(batch_results, key=lambda x: x[0]):
         for item in classifications:
             global_idx = batch_start + item["id"]
@@ -169,6 +194,7 @@ async def classify_transcript(transcript_path: str) -> tuple[str, str, dict]:
         lines = [line.rstrip() for line in f if line.strip()]
 
     print(f"[classifier] Clasificando {len(lines)} líneas con {CLASSIFIER_MODEL}...")
+    print(f"[classifier] Ventana contexto: {CONTEXT_WINDOW} líneas | Ventana clasificación: {CLASSIFY_WINDOW} líneas | Step: {STEP}")
     categories = await _classify_all(lines)
 
     roleplay_lines = [l for l, c in zip(lines, categories) if c == "roleplay"]
@@ -197,7 +223,6 @@ async def classify_transcript(transcript_path: str) -> tuple[str, str, dict]:
     for line, cat in zip(lines, categories):
         if cat != "roleplay":
             continue
-        # Formato: [HH:MM:SS] usuario: texto
         try:
             username = line.split("] ", 1)[1].split(": ", 1)[0]
         except IndexError:
